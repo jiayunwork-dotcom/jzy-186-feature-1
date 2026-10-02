@@ -1,6 +1,6 @@
 import { Fraction } from '../common/fraction';
 import { convert, type FuelProps } from '../units/units.service';
-import type { Gas } from '../factor-library/factor-library.service';
+import type { Carrier, Gas } from '../factor-library/factor-library.service';
 import type { FactorRow } from '../factor-library/factor-library.service';
 import type { ActivityRecord } from '../activity-data/activity-data.service';
 import { NotFoundError } from '../common/errors';
@@ -19,13 +19,15 @@ export interface Caliber {
 }
 
 export interface LeafLineItem {
+  category: 'ACTIVITY' | 'TRANSFER';
   siteCode: string;
   sourceCode: string;
   month: string; // YYYY-MM
   scope: 1 | 2;
   recordNo: string;
-  factorId: number;
+  factorId: number | null;
   gas: Gas;
+  carrier?: Carrier;
   /** activity quantity expressed in the factor's activity unit */
   activityQty: Fraction;
   /** tonnes of this gas emitted by this record */
@@ -36,6 +38,9 @@ export interface LeafLineItem {
 
 /** Per record, one item per gas. The three gases always travel together. */
 export interface RecordLeaf {
+  /** 'ACTIVITY' for evaluated primary activity records; 'TRANSFER' leaves are
+   *  scope-2 emissions embedded in energy received via internal transfer. */
+  category: 'ACTIVITY' | 'TRANSFER';
   siteCode: string;
   sourceCode: string;
   month: string;
@@ -44,11 +49,24 @@ export interface RecordLeaf {
   fuelKey: string;
   unit: string;
   quantity: Fraction;
+  /**
+   * Transfer-only: the producing site/facility, carrier, the exact share of
+   * the sender's allocation pool carried by the transfer and, per gas, which
+   * primary records the embedded mass came from (filled by the lineage
+   * builder; aggregation only uses byGas).
+   */
+  transfer?: {
+    fromSiteCode: string;
+    fromFacilityCode: string;
+    toPointCode: string;
+    carrier: Carrier;
+    share: Fraction;
+  };
   byGas: Record<
     Gas,
     {
-      factorId: number;
-      factor: FactorRow;
+      factorId: number | null;
+      factor: FactorRow | null;
       activityQty: Fraction;
       gasTonnes: Fraction;
       co2eTonnes: Fraction;
@@ -60,6 +78,8 @@ export interface FactorIndex {
   rows: FactorRow[];
   props: Map<string, { density: Fraction | null; ncv: Fraction | null }>;
   gwp: Record<Gas, Fraction>;
+  /** CHP allocation reference efficiency per carrier (versioned parameters). */
+  referenceEfficiencies: Record<Carrier, Fraction>;
 }
 
 /** Select the single applicable factor for (fuel, gas, scope, month). */
@@ -107,6 +127,7 @@ export function evaluateRecord(record: ActivityRecord, idx: FactorIndex): Record
     byGas[gas] = { factorId: factor.id, factor, activityQty, gasTonnes, co2eTonnes };
   }
   return {
+    category: 'ACTIVITY',
     siteCode: record.siteCode,
     sourceCode: record.sourceCode,
     month: record.month,
@@ -132,6 +153,7 @@ export function flattenLeaves(leaves: RecordLeaf[]): LeafLineItem[] {
     for (const gas of ['CO2', 'CH4', 'N2O'] as Gas[]) {
       const g = leaf.byGas[gas];
       out.push({
+        category: leaf.category,
         siteCode: leaf.siteCode,
         sourceCode: leaf.sourceCode,
         month: leaf.month,
@@ -139,6 +161,7 @@ export function flattenLeaves(leaves: RecordLeaf[]): LeafLineItem[] {
         recordNo: leaf.recordNo,
         factorId: g.factorId,
         gas,
+        carrier: leaf.transfer?.carrier,
         activityQty: g.activityQty,
         gasTonnes: g.gasTonnes,
         co2eTonnes: g.co2eTonnes
@@ -146,8 +169,8 @@ export function flattenLeaves(leaves: RecordLeaf[]): LeafLineItem[] {
     }
   }
   out.sort((a, b) => {
-    const ka = `${a.siteCode}|${a.sourceCode}|${a.month}|${a.scope}|${a.recordNo}|${a.gas}`;
-    const kb = `${b.siteCode}|${b.sourceCode}|${b.month}|${b.scope}|${b.recordNo}|${b.gas}`;
+    const ka = `${a.category}|${a.siteCode}|${a.sourceCode}|${a.month}|${a.scope}|${a.recordNo}|${a.gas}`;
+    const kb = `${b.category}|${b.siteCode}|${b.sourceCode}|${b.month}|${b.scope}|${b.recordNo}|${b.gas}`;
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
   return out;
@@ -171,6 +194,13 @@ export interface AggregateRow {
   sourceCode: string | null;
   month: string | null;
   scope: 1 | 2;
+  /**
+   * 'ACTIVITY' rows come from primary records; 'TRANSFER' rows are scope-2
+   * emissions of energy received via internal transfer. They are never
+   * merged with purchased-energy scope 2, so the two origins stay
+   * distinguishable in every site rollup.
+   */
+  category: 'ACTIVITY' | 'TRANSFER';
   totals: GasTotals;
 }
 
@@ -182,6 +212,7 @@ export interface AggregateQuery {
   sourceCode?: string | null;
   month?: string | null;
   scope?: 1 | 2 | null;
+  category?: 'ACTIVITY' | 'TRANSFER' | null;
 }
 
 function zeroTotals(): GasTotals {
@@ -193,17 +224,19 @@ function rowMatches(leaf: RecordLeaf, query: AggregateQuery): boolean {
   if (query.sourceCode && leaf.sourceCode !== query.sourceCode) return false;
   if (query.month && leaf.month !== query.month) return false;
   if (query.scope && leaf.scope !== query.scope) return false;
+  if (query.category && leaf.category !== query.category) return false;
   return true;
 }
 
 /**
  * Aggregate evaluated leaves.
  *
- * `groupBy` names the breakdown dimensions; scope is always a breakdown
- * column (scope 1 and scope 2 must never be silently merged). Rows are
- * returned sorted by every dimension and each gas is accumulated in the
- * fixed record-no order produced by evaluateAll/flattenLeaves, so repeated
- * runs yield bit-identical rationals.
+ * `groupBy` names the breakdown dimensions; scope and leaf category are
+ * always breakdown columns (scope 1 and scope 2, and activity vs internal
+ * transfer scope 2 must never be silently merged). Rows are returned sorted
+ * by every dimension and each gas is accumulated in the fixed record-no
+ * order produced by evaluateAll/flattenLeaves, so repeated runs yield
+ * bit-identical rationals.
  */
 export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): AggregateRow[] {
   const groupBy = new Set<DimensionKey>(query.groupBy ?? ['site', 'source', 'month']);
@@ -212,6 +245,7 @@ export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): Agg
     sourceCode: string | null;
     month: string | null;
     scope: 1 | 2;
+    category: 'ACTIVITY' | 'TRANSFER';
     totals: GasTotals;
   }
   const groups = new Map<string, Group>();
@@ -221,10 +255,10 @@ export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): Agg
     const siteCode = groupBy.has('site') ? leaf.siteCode : null;
     const sourceCode = groupBy.has('source') ? leaf.sourceCode : null;
     const month = groupBy.has('month') ? leaf.month : null;
-    const key = JSON.stringify([siteCode, sourceCode, month, leaf.scope]);
+    const key = JSON.stringify([siteCode, sourceCode, month, leaf.scope, leaf.category]);
     let g = groups.get(key);
     if (!g) {
-      g = { siteCode, sourceCode, month, scope: leaf.scope, totals: zeroTotals() };
+      g = { siteCode, sourceCode, month, scope: leaf.scope, category: leaf.category, totals: zeroTotals() };
       groups.set(key, g);
     }
     // Leaves arrive in record-no order, so this accumulation order is fixed.
@@ -239,7 +273,8 @@ export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): Agg
       (a.siteCode ?? '').localeCompare(b.siteCode ?? '') ||
       (a.sourceCode ?? '').localeCompare(b.sourceCode ?? '') ||
       (a.month ?? '').localeCompare(b.month ?? '') ||
-      a.scope - b.scope
+      a.scope - b.scope ||
+      a.category.localeCompare(b.category)
     );
   });
 }

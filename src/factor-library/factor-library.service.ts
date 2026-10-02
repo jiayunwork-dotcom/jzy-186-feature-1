@@ -8,6 +8,16 @@ import { factorNumeratorToTonnes, parseFactorUnit } from './factor-unit';
 export type Gas = 'CO2' | 'CH4' | 'N2O';
 export const GASES: Gas[] = ['CO2', 'CH4', 'N2O'];
 
+/** Carriers of internally produced/transferred energy. */
+export type Carrier = 'STEAM' | 'HOT_WATER' | 'ELECTRICITY';
+export const CARRIERS: Carrier[] = ['STEAM', 'HOT_WATER', 'ELECTRICITY'];
+
+export interface ReferenceEfficiencyInput {
+  carrier: Carrier;
+  /** Dimensionless reference efficiency eta, strictly positive. */
+  eta: number | string;
+}
+
 export interface FuelPropertyInput {
   fuelKey: string;
   /** kg/m3 */
@@ -33,6 +43,12 @@ export interface PublishFactorVersionInput {
   version: string;
   fuels?: FuelPropertyInput[];
   factors: FactorInput[];
+  /**
+   * CHP allocation reference efficiencies published with this version.
+   * Omitted carriers fall back to built-in defaults; because the defaults are
+   * fixed constants, omitting them never changes an old caliber.
+   */
+  referenceEfficiencies?: ReferenceEfficiencyInput[];
   publishedBy?: string;
   note?: string;
 }
@@ -64,6 +80,21 @@ export interface FactorVersion {
 }
 
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/**
+ * Built-in reference allocation efficiencies (see transfer/network.ts and
+ * README §2.7 for the allocation method):
+ *  - electricity: 0.45  (typical benchmark reference efficiency for power
+ *    generation, in line with EU ETS CHP harmonized reference values)
+ *  - steam / hot water: 0.90 (heat-only benchmark reference efficiency)
+ * They are overridable per factor version; being fixed constants they never
+ * perturb old calibers.
+ */
+export const DEFAULT_REFERENCE_EFFICIENCIES: Record<Carrier, Fraction> = {
+  STEAM: Fraction.from('0.9'),
+  HOT_WATER: Fraction.from('0.9'),
+  ELECTRICITY: Fraction.from('0.45')
+};
 
 export function monthToDate(month: string): Date {
   if (!MONTH_RE.test(month)) {
@@ -173,6 +204,28 @@ function validateFactorInput(input: PublishFactorVersionInput): FieldError[] {
       }
     }
   }
+
+  // CHP reference efficiencies: must be finite, strictly positive decimals.
+  const seenEta = new Set<Carrier>();
+  (input.referenceEfficiencies ?? []).forEach((e, i) => {
+    const prefix = `referenceEfficiencies[${i}]`;
+    if (!CARRIERS.includes(e.carrier)) {
+      errors.push({ field: `${prefix}.carrier`, code: 'INVALID_VALUE', message: `carrier must be one of ${CARRIERS.join('/')}` });
+      return;
+    }
+    if (seenEta.has(e.carrier)) {
+      errors.push({ field: `${prefix}.carrier`, code: 'DUPLICATE_KEY', message: `duplicate reference efficiency for ${e.carrier}` });
+    }
+    seenEta.add(e.carrier);
+    try {
+      const frac = Fraction.from(e.eta);
+      if (frac.sign() <= 0) {
+        errors.push({ field: `${prefix}.eta`, code: 'INVALID_VALUE', message: 'reference efficiency must be strictly positive' });
+      }
+    } catch {
+      errors.push({ field: `${prefix}.eta`, code: 'INVALID_VALUE', message: `not a finite positive decimal: ${String(e.eta)}` });
+    }
+  });
   return errors;
 }
 
@@ -222,8 +275,16 @@ export class FactorLibraryService {
         );
       }
 
-      for (const f of input.factors) {
-        const value = Fraction.from(f.value);
+      for (const e of input.referenceEfficiencies ?? []) {
+        const eta = Fraction.from(e.eta);
+        await client.query(
+          `INSERT INTO chp_reference_efficiencies(factor_version_id, carrier, eta_num, eta_den)
+           VALUES ($1, $2, $3, $4)`,
+          [versionId, e.carrier, eta.num, eta.den]
+        );
+      }
+
+      for (const f of input.factors) {        const value = Fraction.from(f.value);
         // Store the declared unit verbatim; kg normalization is derived.
         await client.query(
           `INSERT INTO emission_factors
@@ -308,11 +369,40 @@ export class FactorLibraryService {
     return map;
   }
 
+  /**
+   * Reference allocation efficiencies of a version, merged over the built-in
+   * defaults. The defaults are fixed constants (documented in the README),
+   * so every carrier always resolves to exactly one positive Fraction and an
+   * older version that published nothing is perfectly reproducible.
+   */
+  async getReferenceEfficiencies(
+    client: Queryer,
+    versionId: number
+  ): Promise<Record<Carrier, Fraction>> {
+    const res = await client.query<{
+      carrier: Carrier;
+      eta_num: string;
+      eta_den: string;
+    }>(
+      `SELECT carrier, eta_num, eta_den
+       FROM chp_reference_efficiencies WHERE factor_version_id = $1`,
+      [versionId]
+    );
+    const out: Record<Carrier, Fraction> = {
+      STEAM: DEFAULT_REFERENCE_EFFICIENCIES.STEAM,
+      HOT_WATER: DEFAULT_REFERENCE_EFFICIENCIES.HOT_WATER,
+      ELECTRICITY: DEFAULT_REFERENCE_EFFICIENCIES.ELECTRICITY
+    };
+    for (const r of res.rows) {
+      out[r.carrier] = Fraction.of(BigInt(r.eta_num), BigInt(r.eta_den));
+    }
+    return out;
+  }
+
   async getFactors(
     client: Queryer,
     versionId: number
-  ): Promise<FactorRow[]> {
-    const res = await client.query<{
+  ): Promise<FactorRow[]> {    const res = await client.query<{
       id: number;
       fuel_key: string;
       gas: Gas;

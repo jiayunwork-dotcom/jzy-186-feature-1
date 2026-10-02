@@ -4,7 +4,7 @@ import {
   RestatementService,
   type RestatementComparisonInput
 } from '../restatement/restatement.service';
-import { fracDto } from '../common/serialize';
+import { fracDto, totalsDto } from '../common/serialize';
 
 @Controller('restatements')
 export class RestatementController {
@@ -40,6 +40,20 @@ export class RestatementController {
         factors: fracDto(c.factors),
         gwp: fracDto(c.gwp)
       })),
+      companyBreakdown: r.companyBreakdown
+        ? {
+            base: {
+              gross: totalsDto(r.companyBreakdown.base.gross),
+              elimination: totalsDto(r.companyBreakdown.base.elimination),
+              net: totalsDto(r.companyBreakdown.base.net)
+            },
+            current: {
+              gross: totalsDto(r.companyBreakdown.current.gross),
+              elimination: totalsDto(r.companyBreakdown.current.elimination),
+              net: totalsDto(r.companyBreakdown.current.net)
+            }
+          }
+        : undefined,
       significance: r.significance
         ? {
             baseYear: r.significance.baseYear,

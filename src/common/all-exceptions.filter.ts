@@ -7,7 +7,7 @@ import {
   Logger
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { ValidationException, ConflictError, NotFoundError } from './errors';
+import { ValidationException, ConflictError, NotFoundError, NetworkStructureError } from './errors';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -44,6 +44,18 @@ export class AllExceptionsFilter implements ExceptionFilter {
         statusCode: HttpStatus.NOT_FOUND,
         error: 'NotFound',
         message: exception.message,
+        path: request.url
+      });
+      return;
+    }
+    if (exception instanceof NetworkStructureError) {
+      response.status(HttpStatus.UNPROCESSABLE_ENTITY).json({
+        statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+        error: 'NetworkStructureError',
+        code: exception.code,
+        message: exception.message,
+        facilities: exception.facilities,
+        month: exception.month,
         path: request.url
       });
       return;

@@ -11,6 +11,8 @@ import { AccountingService } from '../src/accounting/accounting.service';
 import { RestatementService } from '../src/restatement/restatement.service';
 import { CloseService } from '../src/close/close.service';
 import { LineageService } from '../src/lineage/lineage.service';
+import { TransferService } from '../src/transfer/transfer.service';
+import { TransferLineageService } from '../src/transfer/transfer-lineage.service';
 
 export interface Harness {
   app: TestingModule;
@@ -23,6 +25,8 @@ export interface Harness {
   restatement: RestatementService;
   close: CloseService;
   lineage: LineageService;
+  transfer: TransferService;
+  transferLineage: TransferLineageService;
   shutdown: () => Promise<void>;
 }
 
@@ -40,6 +44,8 @@ export async function buildHarness(): Promise<Harness> {
     restatement: app.get(RestatementService),
     close: app.get(CloseService),
     lineage: app.get(LineageService),
+    transfer: app.get(TransferService),
+    transferLineage: app.get(TransferLineageService),
     shutdown: () => app.close()
   };
   // Per-test reset runs via resetHarness(h) in the spec's beforeEach; the
@@ -171,4 +177,19 @@ export async function seedBaseScenario(
 export async function importRecord(h: Harness, rec: ActivityInput & { supersedesRecordNo?: string }) {
   const results = await h.activity.bulkImport({ records: [rec] });
   return results[0];
+}
+
+/**
+ * Create a cut strictly after the preceding write statements.
+ *
+ * Statement timestamps on fast CI machines can share one millisecond; the
+ * cut predicate is `created_at <= as_of`, so a cut opened in the same
+ * millisecond as the commit it is meant to cover may miss it. Waiting for
+ * the clock to advance makes every test deterministic (production callers
+ * create cuts explicitly; the close path uses transaction_timestamp() and is
+ * unaffected).
+ */
+export async function cutAfterWrites(h: Harness, label?: string): Promise<number> {
+  await new Promise((r) => setTimeout(r, 2));
+  return (await h.activity.createCutNow(label)).id;
 }

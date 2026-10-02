@@ -37,7 +37,6 @@ export class CloseController {
       rows: rows.map((r) => ({ ...r, value: fracDto(r.value) }))
     };
   }
-
   @Get(':id/lineage')
   async lineage(
     @Param('id') id: string,
@@ -75,6 +74,9 @@ export class LineageController {
       caliber: report.caliber,
       contributions: report.contributions.map((c) => ({
         ...c,
+        transfer: c.transfer
+          ? { ...c.transfer, share: fracDto(c.transfer.share) }
+          : undefined,
         inputQuantity: { value: fracDto(c.inputQuantity.value), unit: c.inputQuantity.unit },
         perGas: c.perGas.map((g) => ({
           ...g,

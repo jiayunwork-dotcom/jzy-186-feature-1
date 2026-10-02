@@ -21,8 +21,16 @@ export interface LineageContribution {
   sourceCode: string;
   month: string;
   scope: 1 | 2;
+  category: 'ACTIVITY' | 'TRANSFER';
   recordNo: string;
   fuelKey: string;
+  transfer?: {
+    fromSiteCode: string;
+    fromFacilityCode: string;
+    toPointCode: string;
+    carrier: import('../factor-library/factor-library.service').Carrier;
+    share: Fraction;
+  };
   inputQuantity: { value: Fraction; unit: string };
   perGas: Array<{
     gas: Gas;
@@ -76,10 +84,15 @@ export class LineageService {
     });
 
     const matches = bundle.leaves.filter((l) => {
+      // The classic "explain" endpoint reconstructs primary factor lineage:
+      // only ACTIVITY leaves carry factors. Transfer leaves have their own
+      // endpoint (trace-transfer), which returns allocation hops instead.
+      if (l.category !== 'ACTIVITY') return false;
       if (q.siteCode && l.siteCode !== q.siteCode) return false;
       if (q.sourceCode && l.sourceCode !== q.sourceCode) return false;
       if (q.month && l.month !== q.month) return false;
       if (q.scope && l.scope !== q.scope) return false;
+      if (q.category && l.category !== q.category) return false;
       return true;
     });
 
@@ -90,18 +103,28 @@ export class LineageService {
       scope: l.scope,
       recordNo: l.recordNo,
       fuelKey: l.fuelKey,
+      category: l.category,
+      transfer: l.transfer
+        ? {
+            fromSiteCode: l.transfer.fromSiteCode,
+            fromFacilityCode: l.transfer.fromFacilityCode,
+            toPointCode: l.transfer.toPointCode,
+            carrier: l.transfer.carrier,
+            share: l.transfer.share
+          }
+        : undefined,
       inputQuantity: { value: l.quantity, unit: l.unit },
       perGas: GASES.map((gas) => {
         const g = l.byGas[gas];
         return {
           gas,
-          factorId: g.factorId,
-          factorValue: g.factor.value,
-          factorUnit: g.factor.factorUnit,
-          factorValidFrom: g.factor.validFrom,
-          factorValidTo: g.factor.validTo,
+          factorId: g.factorId!,
+          factorValue: g.factor!.value,
+          factorUnit: g.factor!.factorUnit,
+          factorValidFrom: g.factor!.validFrom,
+          factorValidTo: g.factor!.validTo,
           activityQty: g.activityQty,
-          activityUnit: g.factor.activityUnit,
+          activityUnit: g.factor!.activityUnit,
           gasTonnes: g.gasTonnes,
           gwp: bundle.index.gwp[gas],
           co2eTonnes: g.co2eTonnes

@@ -15,6 +15,14 @@ export interface RestatementComparisonInput {
   current: { cutId: number; factorVersionId: number; gwpSetId: number };
   /** Aggregation filter the difference is evaluated at (any rollup level). */
   filter?: AggregateQuery;
+  /**
+   * Site view (default): transfer scope-2 leaves count at the receiving site.
+   * 'company': every corner is the company NET total, i.e. internal transfers
+   * are eliminated. Net = sum of ACTIVITY leaves (mass conservation makes
+   * gross − elimination algebraically identical), so the Shapley identity
+   * and all component attributions carry through unchanged, on net numbers.
+   */
+  view?: 'site' | 'company';
   /** Base year (YYYY) when this comparison is used for the significance check. */
   baseYear?: number;
   significanceThreshold?: number | string;
@@ -27,6 +35,11 @@ export interface RestatementResult {
   currentTotals: GasTotals;
   components: MetricDecomposition[];
   corners: Corners<GasTotals>;
+  /** Company view only: gross site sum and internal-transfer elimination. */
+  companyBreakdown?: {
+    base: { gross: GasTotals; elimination: GasTotals; net: GasTotals };
+    current: { gross: GasTotals; elimination: GasTotals; net: GasTotals };
+  };
   /** Present when baseYear was supplied. */
   significance?: {
     baseYear: number;
@@ -78,7 +91,15 @@ export class RestatementService {
         factorVersionId: d.f,
         gwpSetId: d.g
       });
-      out[d.key] = this.accounting.grandTotal(bundle, filter);
+      if (input.view === 'company') {
+        // Company view: net of internal-transfer eliminations. Equivalent to
+        // summing ACTIVITY leaves only (exact identity, see accounting
+        // companyTotals), evaluated under the supplied month filters.
+        const f: AggregateQuery = { ...filter, category: 'ACTIVITY' };
+        out[d.key] = this.accounting.grandTotal(bundle, f);
+      } else {
+        out[d.key] = this.accounting.grandTotal(bundle, filter);
+      }
     }
 
     const result: RestatementResult = {
@@ -89,6 +110,27 @@ export class RestatementService {
       components: decomposeFromCorners(out),
       corners: out
     };
+
+    if (input.view === 'company') {
+      const [bBundle, cBundle] = await Promise.all([
+        this.accounting.loadBundle(this.db, {
+          cutId: input.base.cutId,
+          factorVersionId: input.base.factorVersionId,
+          gwpSetId: input.base.gwpSetId
+        }),
+        this.accounting.loadBundle(this.db, {
+          cutId: input.current.cutId,
+          factorVersionId: input.current.factorVersionId,
+          gwpSetId: input.current.gwpSetId
+        })
+      ]);
+      const b = this.accounting.companyTotals(bBundle, filter);
+      const c = this.accounting.companyTotals(cBundle, filter);
+      result.companyBreakdown = {
+        base: { gross: b.grossTotal, elimination: b.elimination, net: b.netTotal },
+        current: { gross: c.grossTotal, elimination: c.elimination, net: c.netTotal }
+      };
+    }
 
     if (input.baseYear !== undefined) {
       result.significance = await this.checkBaseYear(input, out.f000.CO2E, out.f111.CO2E);

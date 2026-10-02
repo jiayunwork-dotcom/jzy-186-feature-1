@@ -3,11 +3,13 @@ import { DbModule, DbService } from '../database/database.module';
 import { Fraction } from '../common/fraction';
 import {
   AccountingModule,
-  AccountingService
+  AccountingService,
+  type CaliberBundle
 } from '../accounting/accounting.service';
 import { GwpModule, GwpService } from '../factor-library/gwp.service';
-import { GASES, type Gas } from '../factor-library/factor-library.service';
-import { flattenLeaves } from '../accounting/engine';
+import { GASES, type Gas, type Carrier } from '../factor-library/factor-library.service';
+import { flattenLeaves, type RecordLeaf } from '../accounting/engine';
+import { facilityKey, traceTransfer } from '../transfer/network';
 import {
   ConflictError,
   NotFoundError,
@@ -129,7 +131,10 @@ export class CloseService {
         (l) => l.month === input.month && (!input.siteCode || l.siteCode === input.siteCode)
       );
 
-      // 1) aggregate rows: one row per (site, source, month, scope, gas) plus CO2E
+      // 1) aggregate rows: one row per (site, source, month, scope,
+      //    category, gas) plus CO2E. ACTIVITY and TRANSFER scope-2 rows are
+      //    stored separately so received internal energy is never confused
+      //    with purchased-energy scope 2.
       type AggKey = string;
       const agg = new Map<
         AggKey,
@@ -137,17 +142,19 @@ export class CloseService {
           siteCode: string;
           sourceCode: string;
           scope: 1 | 2;
+          category: 'ACTIVITY' | 'TRANSFER';
           values: { CO2: Fraction; CH4: Fraction; N2O: Fraction; CO2E: Fraction };
         }
       >();
       for (const leaf of leaves) {
-        const key = JSON.stringify([leaf.siteCode, leaf.sourceCode, leaf.scope]);
+        const key = JSON.stringify([leaf.siteCode, leaf.sourceCode, leaf.scope, leaf.category]);
         let row = agg.get(key);
         if (!row) {
           row = {
             siteCode: leaf.siteCode,
             sourceCode: leaf.sourceCode,
             scope: leaf.scope,
+            category: leaf.category,
             values: { CO2: Fraction.ZERO, CH4: Fraction.ZERO, N2O: Fraction.ZERO, CO2E: Fraction.ZERO }
           };
           agg.set(key, row);
@@ -158,31 +165,32 @@ export class CloseService {
         }
       }
       for (const row of [...agg.values()].sort((a, b) =>
-        `${a.siteCode}|${a.sourceCode}|${a.scope}`.localeCompare(
-          `${b.siteCode}|${b.sourceCode}|${b.scope}`
+        `${a.siteCode}|${a.sourceCode}|${a.scope}|${a.category}`.localeCompare(
+          `${b.siteCode}|${b.sourceCode}|${b.scope}|${b.category}`
         )
       )) {
         for (const gas of ['CO2', 'CH4', 'N2O', 'CO2E'] as const) {
           const v = row.values[gas];
           await client.query(
             `INSERT INTO snapshot_rows
-               (close_id, site_code, source_code, month, scope, gas, value_num, value_den)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [closeId, row.siteCode, row.sourceCode, monthDate, row.scope, gas, v.num, v.den]
+               (close_id, site_code, source_code, month, scope, gas, category,
+                value_num, value_den)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [closeId, row.siteCode, row.sourceCode, monthDate, row.scope, gas, row.category, v.num, v.den]
           );
         }
       }
 
       // 2) lineage: one row per (record, gas) with the exact factor and the
-      //    quantity expressed in the factor unit.
-      const flat = flattenLeaves(leaves);
+      //    quantity expressed in the factor unit (ACTIVITY leaves).
+      const flat = flattenLeaves(leaves).filter((l) => l.category === 'ACTIVITY');
       for (const item of flat) {
         await client.query(
           `INSERT INTO snapshot_lineage
              (close_id, site_code, source_code, month, scope, gas, record_no,
               factor_id, activity_qty_num, activity_qty_den,
-              gas_mass_num, gas_mass_den)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+              gas_mass_num, gas_mass_den, category)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'ACTIVITY')`,
           [
             closeId,
             item.siteCode,
@@ -198,6 +206,44 @@ export class CloseService {
             item.gasTonnes.den
           ]
         );
+      }
+
+      // 3) transfer lineage: one row per final-use transfer leaf per gas and
+      //    per upstream primary record, with the exact closed-form allocation
+      //    share (ring effects folded into one coefficient, so lineage never
+      //    expands infinitely). Each row carries the carrier and the full
+      //    allocation path producer -> ... -> this transfer.
+      const transferRows = leaves.filter((l) => l.category === 'TRANSFER');
+      for (const leaf of transferRows) {
+        const traces = buildTransferLineage(bundle, leaf);
+        for (const tr of traces) {
+          for (const gas of GASES) {
+            await client.query(
+              `INSERT INTO snapshot_lineage
+                 (close_id, site_code, source_code, month, scope, gas, record_no,
+                  factor_id, activity_qty_num, activity_qty_den,
+                  gas_mass_num, gas_mass_den, category, carrier,
+                  upstream_record_no, allocation_path)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9,$10,$11,'TRANSFER',$12,$13,$14)`,
+              [
+                closeId,
+                leaf.siteCode,
+                leaf.sourceCode,
+                monthDate,
+                leaf.scope,
+                gas,
+                leaf.recordNo,
+                tr.gasMass[gas].num,
+                tr.gasMass[gas].den,
+                tr.gasMass[gas].num,
+                tr.gasMass[gas].den,
+                tr.carrier,
+                tr.upstreamRecordNo,
+                JSON.stringify(tr.path)
+              ]
+            );
+          }
+        }
       }
 
       await client.query(
@@ -226,16 +272,23 @@ export class CloseService {
   }
 
   /** Materialized snapshot rows (never recomputed; this is disclosure data). */
-  async querySnapshot(query: SnapshotQuery) {
+  async querySnapshot(query: SnapshotQuery & { category?: 'ACTIVITY' | 'TRANSFER' }) {
     const res = await this.db.query(
-      `SELECT site_code, source_code, month, scope, gas, value_num, value_den
+      `SELECT site_code, source_code, month, scope, gas, category, value_num, value_den
        FROM snapshot_rows
        WHERE close_id = $1
          AND ($2::text IS NULL OR site_code = $2)
          AND ($3::text IS NULL OR source_code = $3)
          AND ($4::smallint IS NULL OR scope = $4)
-       ORDER BY site_code, source_code, month, scope, gas`,
-      [query.closeId, query.siteCode ?? null, query.sourceCode ?? null, query.scope ?? null]
+         AND ($5::text IS NULL OR category = $5)
+       ORDER BY site_code, source_code, month, scope, category, gas`,
+      [
+        query.closeId,
+        query.siteCode ?? null,
+        query.sourceCode ?? null,
+        query.scope ?? null,
+        query.category ?? null
+      ]
     );
     return res.rows.map((r) => ({
       siteCode: r.site_code,
@@ -243,22 +296,31 @@ export class CloseService {
       month: (r.month as Date).toISOString().slice(0, 7),
       scope: r.scope,
       gas: r.gas,
+      category: r.category as 'ACTIVITY' | 'TRANSFER',
       value: Fraction.of(BigInt(r.value_num), BigInt(r.value_den))
     }));
   }
 
   /** Lineage rows stored for a snapshot. */
-  async querySnapshotLineage(query: SnapshotQuery) {
+  async querySnapshotLineage(query: SnapshotQuery & { category?: 'ACTIVITY' | 'TRANSFER' }) {
     const res = await this.db.query(
-      `SELECT site_code, source_code, month, scope, gas, record_no, factor_id,
+      `SELECT site_code, source_code, month, scope, gas, category, carrier,
+              record_no, upstream_record_no, allocation_path, factor_id,
               activity_qty_num, activity_qty_den, gas_mass_num, gas_mass_den
        FROM snapshot_lineage
        WHERE close_id = $1
          AND ($2::text IS NULL OR site_code = $2)
          AND ($3::text IS NULL OR source_code = $3)
          AND ($4::smallint IS NULL OR scope = $4)
-       ORDER BY site_code, source_code, record_no, gas`,
-      [query.closeId, query.siteCode ?? null, query.sourceCode ?? null, query.scope ?? null]
+         AND ($5::text IS NULL OR category = $5)
+       ORDER BY site_code, source_code, category, record_no, upstream_record_no, gas`,
+      [
+        query.closeId,
+        query.siteCode ?? null,
+        query.sourceCode ?? null,
+        query.scope ?? null,
+        query.category ?? null
+      ]
     );
     return res.rows.map((r) => ({
       siteCode: r.site_code,
@@ -266,12 +328,107 @@ export class CloseService {
       month: (r.month as Date).toISOString().slice(0, 7),
       scope: r.scope,
       gas: r.gas as Gas,
+      category: r.category as 'ACTIVITY' | 'TRANSFER',
+      carrier: r.carrier as Carrier | null,
       recordNo: r.record_no,
-      factorId: r.factor_id,
+      upstreamRecordNo: r.upstream_record_no as string | null,
+      allocationPath: r.allocation_path as
+        | Array<{
+            transferRecordNo: string;
+            fromFacility: string;
+            toFacilityOrPoint: string;
+            shareNum: string;
+            shareDen: string;
+            producerFacility: string;
+            coefficientNum: string;
+            coefficientDen: string;
+          }>
+        | null,
+      factorId: r.factor_id as number | null,
       activityQty: Fraction.of(BigInt(r.activity_qty_num), BigInt(r.activity_qty_den)),
       gasTonnes: Fraction.of(BigInt(r.gas_mass_num), BigInt(r.gas_mass_den))
     }));
   }
+}
+
+/**
+ * Decompose a final-use TRANSFER leaf's gas masses into one contribution per
+ * upstream primary activity record. The closed-form coefficient
+ * C[sender][producer]·share gives the fraction of each producer facility's
+ * pool carried by the hop; within a producer facility, each primary record
+ * contributes that fraction of its evaluated gas mass. The three gas masses
+ * stay separate (no GWP here); the path records the producing hop with its
+ * exact end-to-end fraction, so stored lineage answers "where did this tonne
+ * come from" exactly and terminates on rings (cycles are in the coefficient).
+ */
+interface TransferLineageTrace {
+  carrier: Carrier;
+  upstreamRecordNo: string;
+  producerFacility: string;
+  fraction: Fraction;
+  gasMass: Record<Gas, Fraction>;
+  path: Array<{
+    transferRecordNo: string;
+    fromFacility: string;
+    toFacilityOrPoint: string;
+    /** this hop's share of its sender's allocation pool */
+    shareNum: string;
+    shareDen: string;
+    /**
+     * Producer facility this row traces to, and the closed-form network
+     * coefficient C[sender][producer]: the exact fraction of the producer's
+     * primary input present in the sender's pool with every ring traversal
+     * already folded in. The effective end-to-end fraction is
+     * hopShare × coefficient; stored explicitly so the lineage row is exact
+     * and self-explanatory for multi-hop chains and rings.
+     */
+    producerFacility: string;
+    coefficientNum: string;
+    coefficientDen: string;
+  }>;
+}
+
+function buildTransferLineage(bundle: CaliberBundle, leaf: RecordLeaf): TransferLineageTrace[] {
+  const solution = bundle.transferLayer.solutions.get(leaf.month);
+  if (!solution || !leaf.transfer) return [];
+  const traced = traceTransfer(solution, leaf.recordNo);
+  if (!traced) return [];
+
+  const primaryByFacility = bundle.transferLayer.primaryLeavesByFacility.get(leaf.month);
+  const carrier = leaf.transfer.carrier;
+  const out: TransferLineageTrace[] = [];
+  for (const [producerKey, coeff] of [...traced.producerCoefficients.entries()].sort((a, b) =>
+    a[0].localeCompare(b[0])
+  )) {
+    const recs = primaryByFacility?.get(producerKey) ?? [];
+    for (const rec of [...recs].sort((a, b) => a.recordNo.localeCompare(b.recordNo))) {
+      const fraction = traced.hop.share.mul(coeff);
+      out.push({
+        carrier,
+        upstreamRecordNo: rec.recordNo,
+        producerFacility: producerKey,
+        fraction,
+        gasMass: {
+          CO2: fraction.mul(rec.byGas.CO2.gasTonnes),
+          CH4: fraction.mul(rec.byGas.CH4.gasTonnes),
+          N2O: fraction.mul(rec.byGas.N2O.gasTonnes)
+        },
+        path: [
+          {
+            transferRecordNo: leaf.recordNo,
+            fromFacility: facilityKey(traced.hop.fromSiteCode, traced.hop.fromFacilityCode),
+            toFacilityOrPoint: `${traced.hop.toSiteCode}/${traced.hop.toPointCode}`,
+            shareNum: traced.hop.share.num.toString(),
+            shareDen: traced.hop.share.den.toString(),
+            producerFacility: producerKey,
+            coefficientNum: coeff.num.toString(),
+            coefficientDen: coeff.den.toString()
+          }
+        ]
+      });
+    }
+  }
+  return out;
 }
 
 /** Stable 64-bit hash for advisory-lock keys (xxhash-style FNV-1a 64). */
