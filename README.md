@@ -17,16 +17,18 @@ src/
   common/          精确有理数 Fraction、错误类型、HTTP 异常过滤器、序列化
   units/           单位换算（质量/体积/能量，经密度与热值跨量纲换算）
   database/        pg 连接池、事务封装、迁移执行器
-  migrations/      0001_schema.sql（全部表、排他约束、部分唯一索引）
-  master-data/     厂区、排放源主数据
-  factor-library/  因子库版本、燃料密度/热值、排放因子适用期、GWP 集合
+  migrations/      0001_schema.sql、0002_transfers.sql（内部转供）
+  master-data/     厂区、排放源、产能设施、用能点主数据
+  factor-library/  因子库版本、燃料密度/热值、载体参考效率、因子适用期、GWP 集合
   activity-data/   活动数据批量导入、更正链、活动数据截止点（cut）
+  transfer/        产出/转供登记（可更正）与精确转供分摊引擎
   accounting/      核算引擎（纯函数）+ 口径装载服务
+  company/         厂区视角与公司抵消视角
   restatement/     两口径对比、Shapley 三因素分解、基准年显著性
   close/           月度关账与披露快照（含快照级追溯行）
-  lineage/         任意口径汇总数字的来源记录与因子解释
+  lineage/         来源因子解释、转供链路追溯、更正反向影响
   interfaces/      NestJS 控制器（HTTP 接口）
-test/              6 个测试文件、33 个用例
+test/              7 个测试文件、51 个用例
 ```
 
 ---
@@ -191,8 +193,9 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 
 | 方法与路径 | 说明 |
 |---|---|
-| `POST /master-data/sites`、`POST /master-data/sources` | 厂区 / 排放源主数据（upsert） |
-| `POST /factor-versions` | 发布因子库版本（燃料物性 + 三气体因子 + 适用期） |
+| `POST /master-data/sites`、`POST /master-data/sources` | 厂区 / 排放源主数据（upsert，源可带 `facilityCode`） |
+| `POST /master-data/facilities`、`POST /master-data/use-points` | 产能设施 / 用能点（内部转供，见 §9） |
+| `POST /factor-versions` | 发布因子库版本（燃料物性 + 三气体因子 + 适用期 + 可选载体参考效率） |
 | `GET /factor-versions` | 版本列表 |
 | `POST /gwp-sets`、`GET /gwp-sets` | 发布 / 列出 GWP 集合（AR5、AR6…） |
 | `POST /activity-records/import` | 批量导入（逐条回报；可带 `validateAgainstFactorVersion`） |
@@ -200,15 +203,19 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 | `GET /activity-records/:recordNo` | 查单条记录 |
 | `POST /activity-records/cuts` | 创建截止点（不传 `asOf` 即“当前已提交的全部”） |
 | `GET /activity-records/cuts/:id` | 查截止点 |
-| `POST /accounting/summary` | 按口径汇总；`groupBy` 任取 `site/source/month`，带 filter |
+| `POST /energy-outputs/import`·`/correct`、`POST /energy-transfers/import`·`/correct` | 月度设施产出 / 内部转供登记与更正 |
+| `POST /accounting/summary` | 按口径汇总；行带 `category`（DIRECT/TRANSFER） |
+| `POST /accounting/company-report` | 公司视角：抵消前各厂合计、内部抵消额、净额 |
+| `POST /accounting/transfer-trace` | 转供范围二数字正向追到原始燃料/因子 |
+| `GET /accounting/snapshot-impact/:recordNo` | 更正对已关账快照的反向影响（只读） |
 | `POST /restatements/compare` | 两口径对比 + Shapley 分解；可带 `baseYear`/阈值 |
 | `GET /restatements/base-year-flags/:year` | 基准年标记 |
 | `GET /restatements/notes?baseYear=` | 重述说明记录 |
 | `POST /closes` | 月度关账，生成披露快照 |
 | `GET /closes/:id` | 关账元数据（锁定的 cut/因子/GWP） |
-| `GET /closes/:id/snapshot` | 快照数字 |
-| `GET /closes/:id/lineage` | 快照逐行因子血缘 |
-| `POST /lineage/explain` | 任意口径汇总数字由哪些记录、哪些因子得出 |
+| `GET /closes/:id/snapshot` | 快照数字（带 `category`） |
+| `GET /closes/:id/lineage`、`GET /closes/:id/transfer-lineage` | 快照直接血缘 / 转供血缘 |
+| `POST /lineage/explain` | 任意口径汇总数字由哪些记录、因子、转供来源得出 |
 
 数字出参统一为 `{ "decimal": "5.61", "num": "561", "den": "100" }`：
 `decimal` 用于展示，`num/den` 用于逐位相等的断言。
@@ -231,7 +238,7 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 
 ---
 
-## 6. 测试（Jest，33 个用例，6 个文件）
+## 6. 测试（Jest，51 个用例，7 个文件）
 
 - `fraction.spec.ts`：5.61 t 算例、精确解析、严格相等；
 - `units.spec.ts`：SI 换算精确、密度+热值跨量纲**往返不变**、缺物性时报错；
@@ -245,6 +252,14 @@ changeRatio = |新口径 CO2e − 基准口径 CO2e| / |基准口径 CO2e|
 - `activity-data.spec.ts`：逐条校验（负/非有限数、单位不可换算、月份超期、
   更正目标缺失/已更正、因子期重叠）；**并发更正只接受一个**；
   **重复提交幂等不重复计数**；更正链在 cut 处取链头。
+- `transfer.spec.ts`：**14.025 t 手算例**（东厂范围一仍 56.1 t）；任一设施
+  投入排放=各项产出分摊之和逐位相等；参考效率热电切分；东西厂区**成环可解
+  且守恒**；**全闭环无最终用途时报错并点名设施**；只换 GWP 转供链路气体质量
+  不变；只换因子→西厂变化全归因子分量、只更正东厂燃料→全归活动分量；跨厂
+  正向追溯（含环路径有限展开+精确份额）；反向影响列出仅经转供受影响的厂区；
+  关账后上游更正不动下游快照；超量转供/自转/缺用能点/单位不可换算/有转供无
+  产出/产出调低致超量等逐条字段校验；**无转供数据时结果与旧引擎逐位一致**；
+  关账快照含 TRANSFER 行与转供血缘。
 
 集成测试共用一个 PostgreSQL 库、每个测试文件持有独立连接池，因此 Jest 配置
 固定 `maxWorkers: 1`（即 `--runInBand`），避免跨文件的 `TRUNCATE ... RESTART
@@ -287,7 +302,143 @@ npm run build && npm start
 - `emission_factors` 上的 **GiST 排他约束**排除同版本同燃料/气体/范围适用期
   重叠（相邻期间允许）；
 - 因子版本、GWP 集合只追加，外键 `ON DELETE` 仅用于级联清理，业务上不删除；
-- `snapshot_rows` 主键为 `(close_id, site, source, month, scope, gas)`，
+- `snapshot_rows` 主键为 `(close_id, site, source, month, scope, gas, category)`，
   含 `CO2/CH4/N2O/CO2E` 四行；`snapshot_lineage` 按 `(close_id, record_no, gas)`
   记录因子 id、换算到因子单位的活动量、气体质量；
 - 所有 id 用 `integer GENERATED ALWAYS AS IDENTITY`；计量值分子分母用 `bigint`。
+
+---
+
+## 9. 内部转供（厂区间蒸汽 / 电量往来）
+
+内部能量往来的完整设计。锅炉房、汽轮机等**产能设施**每月登记产出（蒸汽 /
+电 / 热水等载体）和送往其他厂区用能点的转供量；投入设施的燃料燃烧和外购
+电仍是普通活动记录，其排放沿转供网络精确分摊到最终用户。
+
+### 9.1 数据对象
+
+| 对象 | 表 | 说明 |
+|---|---|---|
+| 产能设施 | `facilities` | 唯一编码，归属唯一厂区 |
+| 用能点 | `energy_use_points` | 厂区内的交付点；可挂接一个设施（汽轮机入口），也可以是最终用途（空） |
+| 载体参考效率 | `carrier_efficiencies` | **随因子版本发布**，每个载体一个 (0,1] 的参考效率 |
+| 月度产出 | `energy_outputs` | 设施 × 月 × 载体，单位必须是能量单位（精确换算到 GJ） |
+| 月度转供 | `energy_transfers` | 设施 → 厂区/用能点 × 月 × 载体 |
+| 设施投入 | `activity_records`（源挂 `facility_code`） | 该设施烧掉的燃料、用的外购电等 |
+
+产出和转供记录与活动记录完全同一套纪律：唯一 `record_no`、内容一致的重复
+提交返回 `duplicate` 不重复计数、更正为带 `supersedes_record_no` 的新记录
+（部分唯一索引保证一条记录最多被更正一次，并是并发的最后防线）、截止点可见
+集只含 `created_at <= as_of` 且链头未被取代的记录——所以关账快照只认关账
+开始那一刻之前提交的产出和转供。
+
+### 9.2 分摊方法：参考效率法（决定）
+
+一座热电联产设施同时供热和发电时，三种候选切法的取舍：
+
+- **按能量含量切**（每 GJ 等价）：电的品位远高于热，会把过多排放压给热用户，
+  对电用户有利；
+- **按可用能/做功切**：方向相反，惩罚热用户；
+- **参考效率法（本系统采用）**：每种产品按它来自一台独立参考机组时的效率
+  折算，权重 `w_c = Q_c / η_c`，份额 `p_fc = w_c / Σ w_c′`。这是 GHG
+  Protocol、ISO 14064-1 与 IEA 对热电联产的标准折中：热用户按供热参考效率
+  （蒸汽约 0.9）承担，电用户按发电参考效率（约 0.4）承担，两边都不被
+  系统性偏袒。
+
+**参数从哪来、要不要随因子库发布：** `η_c` 存为因子版本的一部分
+（`carrier_efficiencies`）。它本质上是分配参数，必须与因子同版本冻结：换
+参考效率就是一次因子库变更，在两口径差额分解中整额落在「因子」分量；核算
+绝不会在运行期偷偷换分母。产出某载体但该版本没有对应 η 时，核算明确报错
+（`CARRIER_EFFICIENCY_MISSING`），不静默给数。
+
+### 9.3 网络方程与成环求解
+
+月份之间彼此独立。设施 f 送出的每条边（载体 c、能量 q）携带其当前**累积
+责任** `E_f` 的 `p_fc·q/Q_fc`。累积责任满足
+
+```
+E_f = D_f + Σ_进入设施的边 边携带量
+```
+
+即线性方程组 `(I − M)E = D`，其中 `M[to][from]` 是发送方输出按参考效率
+份额流出到接收设施的精确比例。
+
+- **查单个厂区算不算整张网：** 算。一次求解全公司当月全部设施（按编码
+  确定顺序），任何厂区数字都是同一组精确解的投影；没有逐步近似，也就没有
+  路径截断误差。
+- **精确性：** M 与解全是约分分数，高斯-若尔当消元选主元顺序固定，结果
+  是精确有理数，同一口径重复查询逐位一致。分母只含因子/效率/能量比值的
+  2、5 因子时为有限小数；否则分数原样保留。
+- **全闭环、无最终用途：** 若一组设施的全部产出只在彼此间循环（没有任何
+  边落到不挂设施的用能点，也没有任何产出留存自用），(I−M) 奇异。系统先用
+  反向可达性把这批设施点名出来，抛 `TRANSFER_NETWORK_NO_FINAL_USE` 并列明
+  设施编码，不卡死、不除零。
+- **开销：** 每月对 n 个设施做一次 O(n³) 精确消元和 O(边数) 扫描；厂区/
+  关系变多以后是立方增长，但矩阵小、元素为分数且纯内存，且每口径只算一次。
+
+### 9.4 范围归属与厂区 / 公司两视角
+
+- **生产者厂区：** 燃料燃烧的范围一全额留在生产厂区（例子里东厂范围一
+  始终 56.1 t，送出蒸汽不减 Scope 1）。
+- **接收方厂区：** 每收到一次内部能量就在接收厂区记一条**范围二、类别
+  TRANSFER** 的虚拟记录（来源标记为 `TRANSFER:<用能点>`，与外购电的范围二
+  DIRECT 行天然分开）。西厂收到的 200 GJ 蒸汽：唯一载体时份额即能量比
+  200/800，CO₂ = 56.1 × 1/4 = **14.025 t**。
+- **公司视角：** 厂区视角相加会把内部能量算两遍；公司合并只做一件事——
+  减去全部内部转供的范围二镜像。`POST /accounting/company-report` 同时给
+  抵消前各厂合计 `gross`、抵消额 `internalElimination` 和抵消后 `net`，
+  差额一目了然。净结果等于原始燃烧各算一次：净 56.1 t。
+- **守恒恒等式（逐位）：** Σ 设施投入 D 的某气体质量 = Σ 落到最终用能点
+  的边 + Σ 留存产出。设施间的边是中间流，不计入最终用途。
+- **只改转供量：** 燃料与外购电不变时，公司净合计逐位不变；变化只在厂区
+  之间与抵消额之间移动（此消彼长）。
+
+### 9.5 差额分解、追溯与关账
+
+- **Shapley 分解照常成立。** 转供网络只是口径求值的一部分：只换因子版本
+  （含 η）时西厂转供范围二的变化整额落在「因子」分量；只更正东厂燃料记录
+  时，西厂经由转供受到的影响整额落在「活动」分量（有测试锁定）。换 GWP
+  集合时三气体质量在转供链路上逐位不变，只有 CO2e 变。
+- **正向追溯：** `POST /accounting/transfer-trace` 从一个接收方范围二数字
+  一路追到东厂原始燃料记录与所用因子，每一跳带精确分摊系数。成环时走一条
+  确定性 BFS 简单路径（不无限展开），并给出该路径系数 `pathShare` 与精确
+  总份额 `exactShare`，两者之比即环的循环放大系数。
+- **反向影响：** `GET /accounting/snapshot-impact/:recordNo` 回答“某条记录
+  更正后，哪些**已关账**快照按最新数据重算会变”，区分直接受影响
+  （DIRECT）与仅经由转供受影响的厂区（TRANSFER）。它是只读查询：快照本身
+  永不改写。
+- **关账语义不变：** 关账在 REPEATABLE READ 事务内锁定 cut/因子/GWP，关账
+  之后东厂补报或更正，西厂已关账快照纹丝不动。迁移只给 `snapshot_rows`
+  增加分类列（旧行盖 DIRECT，旧主键重建为含 category 的新主键），旧快照与其
+  血缘不重算、不改写；新关账额外把转供血缘写入 `snapshot_transfer_lineage`。
+- **校验（都指到具体字段）：** 转供超过当月产出 `TRANSFER_EXCEEDS_OUTPUT`；
+  转给设施自身入口 `TRANSFER_TO_SELF`；目标厂区/用能点不存在 `NOT_FOUND`；
+  产出/转供单位不是可换算到 GJ 的能量单位 `UNIT_NOT_CONVERTIBLE`；某月有
+  转供却无产出 `TRANSFER_WITHOUT_OUTPUT`（登记批量校验拦截，核算时再兜底，
+  相关月份核算直接报错，绝不悄悄给错数）；产出被更正调低到已转供量以下，
+  批量记账即拒绝且核算报错。
+
+### 9.6 新增接口
+
+| 方法与路径 | 说明 |
+|---|---|
+| `POST /master-data/facilities` | 登记产能设施（编码、所属厂区） |
+| `POST /master-data/use-points` | 登记用能点（可挂接设施） |
+| `POST /master-data/sources` | 排放源新增可选 `facilityCode`（设施投入） |
+| `POST /factor-versions` | 新增可选 `carriers: [{carrier, refEfficiency}]` |
+| `POST /energy-outputs/import` · `/correct` | 月度产出登记 / 更正 |
+| `POST /energy-transfers/import` · `/correct` | 月度转供登记 / 更正 |
+| `POST /accounting/company-report` | 厂区合计 / 内部抵消额 / 公司净额 |
+| `POST /accounting/transfer-trace` | 转供范围二数字的正向链路追溯 |
+| `GET /accounting/snapshot-impact/:recordNo` | 更正对已关账快照的反向影响 |
+| `GET /closes/:id/transfer-lineage` | 快照度存的转供血缘 |
+| `/accounting/summary`、`/lineage/explain` | 行新增 `category`（DIRECT/TRANSFER），explain 增加转供贡献 |
+
+### 9.7 平滑升级
+
+- 库里没有任何产出/转供记录时，全部叶子都是 DIRECT，现有所有接口结果与
+  升级前逐位一致（有专门测试锁定）；
+- `0002_transfers.sql` 只加表与可空/带默认值的列，随应用启动自动迁移；
+- 升级前已关账的快照及其血缘一行不改写、不重算。
+
+## 10. 测试（Jest，51 个用例，7 个文件）

@@ -98,7 +98,7 @@ describe('accounting engine (integration)', () => {
     // and stable against a different summation route
     const bundle = await h.accounting.loadCaliber({ cutId, factorVersionId, gwpSetId });
     const byAggregate = h.accounting.grandTotal(bundle).CO2E;
-    const byFold = bundle.leaves
+    const byFold = bundle.directLeaves
       .flatMap((l) => (['CO2', 'CH4', 'N2O'] as const).map((g) => l.byGas[g].co2eTonnes))
       .sort((a, b) => (a.key() < b.key() ? -1 : 1))
       .reduce((a, b) => a.add(b), Fraction.ZERO);

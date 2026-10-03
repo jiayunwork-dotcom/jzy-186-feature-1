@@ -129,7 +129,9 @@ export class CloseService {
         (l) => l.month === input.month && (!input.siteCode || l.siteCode === input.siteCode)
       );
 
-      // 1) aggregate rows: one row per (site, source, month, scope, gas) plus CO2E
+      // 1) aggregate rows: one row per (site, source, month, scope, category,
+      //    gas) plus CO2E. DIRECT rows are exactly the pre-migration snapshot
+      //    content; TRANSFER rows are the internal-transfer scope 2.
       type AggKey = string;
       const agg = new Map<
         AggKey,
@@ -137,45 +139,58 @@ export class CloseService {
           siteCode: string;
           sourceCode: string;
           scope: 1 | 2;
+          category: 'DIRECT' | 'TRANSFER';
           values: { CO2: Fraction; CH4: Fraction; N2O: Fraction; CO2E: Fraction };
         }
       >();
       for (const leaf of leaves) {
-        const key = JSON.stringify([leaf.siteCode, leaf.sourceCode, leaf.scope]);
+        const category = leaf.kind === 'transfer' ? 'TRANSFER' : 'DIRECT';
+        const key = JSON.stringify([leaf.siteCode, leaf.sourceCode, leaf.scope, category]);
         let row = agg.get(key);
         if (!row) {
           row = {
             siteCode: leaf.siteCode,
             sourceCode: leaf.sourceCode,
             scope: leaf.scope,
+            category,
             values: { CO2: Fraction.ZERO, CH4: Fraction.ZERO, N2O: Fraction.ZERO, CO2E: Fraction.ZERO }
           };
           agg.set(key, row);
         }
-        for (const gas of GASES) {
-          row.values[gas] = row.values[gas].add(leaf.byGas[gas].gasTonnes);
-          row.values.CO2E = row.values.CO2E.add(leaf.byGas[gas].co2eTonnes);
+        if (leaf.kind === 'transfer') {
+          row.values[leaf.gas] = row.values[leaf.gas].add(leaf.gasTonnes);
+          row.values.CO2E = row.values.CO2E.add(leaf.co2eTonnes);
+        } else {
+          for (const gas of GASES) {
+            row.values[gas] = row.values[gas].add(leaf.byGas[gas].gasTonnes);
+            row.values.CO2E = row.values.CO2E.add(leaf.byGas[gas].co2eTonnes);
+          }
         }
       }
       for (const row of [...agg.values()].sort((a, b) =>
-        `${a.siteCode}|${a.sourceCode}|${a.scope}`.localeCompare(
-          `${b.siteCode}|${b.sourceCode}|${b.scope}`
+        `${a.siteCode}|${a.sourceCode}|${a.scope}|${a.category}`.localeCompare(
+          `${b.siteCode}|${b.sourceCode}|${b.scope}|${b.category}`
         )
       )) {
         for (const gas of ['CO2', 'CH4', 'N2O', 'CO2E'] as const) {
           const v = row.values[gas];
           await client.query(
             `INSERT INTO snapshot_rows
-               (close_id, site_code, source_code, month, scope, gas, value_num, value_den)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [closeId, row.siteCode, row.sourceCode, monthDate, row.scope, gas, v.num, v.den]
+               (close_id, site_code, source_code, month, scope, category, gas, value_num, value_den)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [closeId, row.siteCode, row.sourceCode, monthDate, row.scope, row.category, gas, v.num, v.den]
           );
         }
       }
 
-      // 2) lineage: one row per (record, gas) with the exact factor and the
-      //    quantity expressed in the factor unit.
-      const flat = flattenLeaves(leaves);
+      // 2) direct lineage: one row per (record, gas) with the exact factor and
+      //    quantity expressed in the factor unit. Only terminal direct leaves
+      //    land here; facility-bound inputs are traced through the transfer
+      //    lineage table below.
+      const directLeaves = bundle.directLeaves.filter(
+        (l) => l.month === input.month && (!input.siteCode || l.siteCode === input.siteCode)
+      );
+      const flat = flattenLeaves(directLeaves);
       for (const item of flat) {
         await client.query(
           `INSERT INTO snapshot_lineage
@@ -198,6 +213,38 @@ export class CloseService {
             item.gasTonnes.den
           ]
         );
+      }
+
+      // 3) transfer lineage: one row per edge × gas × originating record,
+      //    with the exact share of that origin carried by the edge.
+      const transferLeaves = bundle.transferLeaves.filter(
+        (l) => l.month === input.month && (!input.siteCode || l.siteCode === input.siteCode)
+      );
+      for (const leaf of transferLeaves) {
+        for (const o of leaf.origins) {
+          await client.query(
+            `INSERT INTO snapshot_transfer_lineage
+               (close_id, month, edge_from_facility, edge_to_site, edge_to_use_point,
+                carrier, gas, origin_record_no, origin_factor_id,
+                share_num, share_den, gas_mass_num, gas_mass_den)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            [
+              closeId,
+              monthDate,
+              leaf.edge.fromFacility,
+              leaf.edge.toSite,
+              leaf.edge.toUsePoint,
+              leaf.edge.carrier,
+              leaf.gas,
+              o.recordNo,
+              o.factorId,
+              o.share.num,
+              o.share.den,
+              o.gasTonnes.num,
+              o.gasTonnes.den
+            ]
+          );
+        }
       }
 
       await client.query(
@@ -228,13 +275,13 @@ export class CloseService {
   /** Materialized snapshot rows (never recomputed; this is disclosure data). */
   async querySnapshot(query: SnapshotQuery) {
     const res = await this.db.query(
-      `SELECT site_code, source_code, month, scope, gas, value_num, value_den
+      `SELECT site_code, source_code, month, scope, category, gas, value_num, value_den
        FROM snapshot_rows
        WHERE close_id = $1
          AND ($2::text IS NULL OR site_code = $2)
          AND ($3::text IS NULL OR source_code = $3)
          AND ($4::smallint IS NULL OR scope = $4)
-       ORDER BY site_code, source_code, month, scope, gas`,
+       ORDER BY site_code, source_code, month, scope, category, gas`,
       [query.closeId, query.siteCode ?? null, query.sourceCode ?? null, query.scope ?? null]
     );
     return res.rows.map((r) => ({
@@ -242,6 +289,7 @@ export class CloseService {
       sourceCode: r.source_code,
       month: (r.month as Date).toISOString().slice(0, 7),
       scope: r.scope,
+      category: r.category as 'DIRECT' | 'TRANSFER',
       gas: r.gas,
       value: Fraction.of(BigInt(r.value_num), BigInt(r.value_den))
     }));
@@ -269,6 +317,32 @@ export class CloseService {
       recordNo: r.record_no,
       factorId: r.factor_id,
       activityQty: Fraction.of(BigInt(r.activity_qty_num), BigInt(r.activity_qty_den)),
+      gasTonnes: Fraction.of(BigInt(r.gas_mass_num), BigInt(r.gas_mass_den))
+    }));
+  }
+
+  /** Materialized transfer lineage rows for a snapshot. */
+  async querySnapshotTransferLineage(query: SnapshotQuery) {
+    const res = await this.db.query(
+      `SELECT month, edge_from_facility, edge_to_site, edge_to_use_point, carrier,
+              gas, origin_record_no, origin_factor_id,
+              share_num, share_den, gas_mass_num, gas_mass_den
+       FROM snapshot_transfer_lineage
+       WHERE close_id = $1
+         AND ($2::text IS NULL OR edge_to_site = $2)
+       ORDER BY month, edge_to_site, edge_to_use_point, carrier, gas, origin_record_no`,
+      [query.closeId, query.siteCode ?? null]
+    );
+    return res.rows.map((r) => ({
+      month: (r.month as Date).toISOString().slice(0, 7),
+      edgeFromFacility: r.edge_from_facility,
+      edgeToSite: r.edge_to_site,
+      edgeToUsePoint: r.edge_to_use_point,
+      carrier: r.carrier,
+      gas: r.gas as Gas,
+      originRecordNo: r.origin_record_no,
+      originFactorId: r.origin_factor_id,
+      share: Fraction.of(BigInt(r.share_num), BigInt(r.share_den)),
       gasTonnes: Fraction.of(BigInt(r.gas_mass_num), BigInt(r.gas_mass_den))
     }));
   }

@@ -1,7 +1,6 @@
 import { Test, type TestingModule } from '@nestjs/testing';
 import { AppModule } from '../src/app.module';
-import { DbService, PG_POOL } from '../src/database/database.module';
-import type { Pool } from 'pg';
+import { DbService } from '../src/database/database.module';
 import { MasterDataService } from '../src/master-data/master-data.service';
 import { resetTables } from './db';
 import { FactorLibraryService, type PublishFactorVersionInput } from '../src/factor-library/factor-library.service';
@@ -11,6 +10,9 @@ import { AccountingService } from '../src/accounting/accounting.service';
 import { RestatementService } from '../src/restatement/restatement.service';
 import { CloseService } from '../src/close/close.service';
 import { LineageService } from '../src/lineage/lineage.service';
+import { EnergyMasterService } from '../src/master-data/energy-master.service';
+import { EnergyFlowService } from '../src/transfer/energy-flow.service';
+import { CompanyService } from '../src/company/company.service';
 
 export interface Harness {
   app: TestingModule;
@@ -23,6 +25,9 @@ export interface Harness {
   restatement: RestatementService;
   close: CloseService;
   lineage: LineageService;
+  energyMaster: EnergyMasterService;
+  flows: EnergyFlowService;
+  company: CompanyService;
   shutdown: () => Promise<void>;
 }
 
@@ -40,6 +45,9 @@ export async function buildHarness(): Promise<Harness> {
     restatement: app.get(RestatementService),
     close: app.get(CloseService),
     lineage: app.get(LineageService),
+    energyMaster: app.get(EnergyMasterService),
+    flows: app.get(EnergyFlowService),
+    company: app.get(CompanyService),
     shutdown: () => app.close()
   };
   // Per-test reset runs via resetHarness(h) in the spec's beforeEach; the
@@ -60,6 +68,8 @@ export interface SeedScenarioOptions {
   gwpCode?: string;
   gwp?: { CO2: string; CH4: string; N2O: string };
   sites?: Array<{ code: string; sources: Array<{ code: string; fuelKey: string; scope: 1 | 2 }> }>;
+  /** Carrier reference efficiencies included in the factor version. */
+  carriers?: Array<{ carrier: string; refEfficiency: string }>;
 }
 
 export async function seedBaseScenario(
@@ -93,6 +103,7 @@ export async function seedBaseScenario(
     fuels: [
       { fuelKey: 'natural_gas', density: '0.8', ncv: '45' }
     ],
+    carriers: opts.carriers,
     factors: [
       {
         fuelKey: 'natural_gas',

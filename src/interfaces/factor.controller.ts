@@ -56,6 +56,7 @@ export class MasterDataController {
       name: string;
       fuelKey: string;
       scope: 1 | 2;
+      facilityCode?: string | null;
     }
   ) {
     return this.master.upsertSource(body).then(() => ({ ok: true }));

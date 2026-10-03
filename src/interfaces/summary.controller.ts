@@ -38,6 +38,7 @@ export class SummaryController {
         sourceCode: r.sourceCode,
         month: r.month,
         scope: r.scope,
+        category: r.category,
         totals: totalsDto(r.totals)
       })),
       grandTotal: totalsDto(this.accounting.grandTotal(bundle, body.filter ?? {}))

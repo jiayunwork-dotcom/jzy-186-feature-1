@@ -7,9 +7,10 @@ export const TEST_DATABASE_URL =
 export const testPool = new Pool({ connectionString: TEST_DATABASE_URL, max: 4 });
 
 export const RESET_TABLES_SQL =
-  'TRUNCATE snapshot_lineage, snapshot_rows, close_periods, restatement_notes, ' +
-  'base_year_flags, activity_records, activity_cuts, emission_factors, ' +
-  'fuel_properties, factor_versions, gwp_values, gwp_sets, emission_sources, sites ' +
+  'TRUNCATE snapshot_transfer_lineage, snapshot_lineage, snapshot_rows, close_periods, ' +
+  'restatement_notes, base_year_flags, energy_transfers, energy_outputs, activity_records, ' +
+  'activity_cuts, emission_factors, fuel_properties, carrier_efficiencies, factor_versions, ' +
+  'gwp_values, gwp_sets, energy_use_points, emission_sources, facilities, sites ' +
   'RESTART IDENTITY CASCADE';
 
 /** Reset using whatever pool the test actually uses (avoids cross-pool locks). */

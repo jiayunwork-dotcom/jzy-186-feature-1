@@ -61,6 +61,28 @@ export class CloseController {
       }))
     };
   }
+
+  @Get(':id/transfer-lineage')
+  async transferLineage(
+    @Param('id') id: string,
+    @Query('siteCode') siteCode?: string,
+    @Query('scope') scope?: string
+  ) {
+    const q: SnapshotQuery = {
+      closeId: parseInt(id, 10),
+      siteCode: siteCode ?? undefined,
+      scope: scope ? (parseInt(scope, 10) as 1 | 2) : undefined
+    };
+    const rows = await this.close.querySnapshotTransferLineage(q);
+    return {
+      closeId: q.closeId,
+      rows: rows.map((r) => ({
+        ...r,
+        share: fracDto(r.share),
+        gasTonnes: fracDto(r.gasTonnes)
+      }))
+    };
+  }
 }
 
 @Controller('lineage')
@@ -83,6 +105,18 @@ export class LineageController {
           gasTonnes: fracDto(g.gasTonnes),
           gwp: fracDto(g.gwp),
           co2eTonnes: fracDto(g.co2eTonnes)
+        }))
+      })),
+      transferredContributions: report.transferredContributions.map((c) => ({
+        ...c,
+        perGas: c.perGas.map((g) => ({
+          gas: g.gas,
+          gasTonnes: fracDto(g.gasTonnes),
+          origins: g.origins.map((o) => ({
+            ...o,
+            share: fracDto(o.share),
+            gasTonnes: fracDto(o.gasTonnes)
+          }))
         }))
       }))
     };

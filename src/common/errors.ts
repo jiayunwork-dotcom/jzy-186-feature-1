@@ -18,6 +18,11 @@ export interface FieldError {
     | 'SCOPE_MISMATCH'
     | 'FACTOR_NOT_APPLICABLE'
     | 'ALREADY_CLOSED'
+    | 'TRANSFER_EXCEEDS_OUTPUT'
+    | 'TRANSFER_WITHOUT_OUTPUT'
+    | 'TRANSFER_TO_SELF'
+    | 'CARRIER_EFFICIENCY_MISSING'
+    | 'TRANSFER_NETWORK_NO_FINAL_USE'
     | 'INVALID_VALUE';
   message: string;
   /** Present on per-record import results. */
@@ -48,5 +53,23 @@ export class NotFoundError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'NotFoundError';
+  }
+}
+
+/**
+ * Accounting-time error in the monthly transfer network. Carries the exact
+ * record field / month it applies to and — for the unreachable-loop case —
+ * the list of facilities whose production never reaches a final use, so the
+ * message names them instead of hanging or dividing by zero.
+ */
+export class TransferNetworkError extends Error {
+  constructor(
+    readonly code: FieldError['code'],
+    message: string,
+    readonly fields: FieldError[],
+    readonly facilities?: string[]
+  ) {
+    super(message);
+    this.name = 'TransferNetworkError';
   }
 }

@@ -5,6 +5,7 @@ import { FactorApiModule } from './interfaces/factor.controller';
 import { SummaryApiModule } from './interfaces/summary.controller';
 import { RestatementApiModule } from './interfaces/restatement.controller';
 import { CloseApiModule } from './interfaces/close.controller';
+import { TransferApiModule } from './interfaces/transfer.controller';
 
 @Module({
   imports: [
@@ -13,7 +14,8 @@ import { CloseApiModule } from './interfaces/close.controller';
     FactorApiModule,
     SummaryApiModule,
     RestatementApiModule,
-    CloseApiModule
+    CloseApiModule,
+    TransferApiModule
   ]
 })
 export class AppModule {}

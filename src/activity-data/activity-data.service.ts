@@ -62,6 +62,7 @@ interface StoredRecord {
   is_correction: boolean;
   supersedes_record_no: string | null;
   created_at: Date;
+  facility_code: string | null;
 }
 
 function monthToString(d: Date): string {
@@ -73,6 +74,11 @@ export interface ActivityRecord extends Omit<ActivityInput, 'supersedesRecordNo'
   isCorrection: boolean;
   supersedesRecordNo: string | null;
   createdAt: Date;
+  /**
+   * Facility this source (and therefore record) feeds. Resolved from
+   * emission_sources; null = terminal direct record.
+   */
+  facilityCode: string | null;
 }
 
 function hydrate(r: StoredRecord): ActivityRecord {
@@ -88,7 +94,8 @@ function hydrate(r: StoredRecord): ActivityRecord {
     unit: r.unit,
     isCorrection: r.is_correction,
     supersedesRecordNo: r.supersedes_record_no,
-    createdAt: r.created_at
+    createdAt: r.created_at,
+    facilityCode: r.facility_code
   };
 }
 
@@ -268,10 +275,13 @@ export class ActivityDataService {
       const existing = new Map<string, StoredRecord>();
       if (nos.length) {
         const res = await client.query<StoredRecord>(
-          `SELECT record_no, site_code, source_code, month, fuel_key, scope,
-                  quantity_num, quantity_den, unit, is_correction,
-                  supersedes_record_no, created_at
-           FROM activity_records WHERE record_no = ANY($1)`,
+          `SELECT r.record_no, r.site_code, r.source_code, r.month, r.fuel_key,
+                  r.scope, r.quantity_num, r.quantity_den, r.unit, r.is_correction,
+                  r.supersedes_record_no, r.created_at, es.facility_code
+           FROM activity_records r
+           JOIN emission_sources es
+             ON es.site_code = r.site_code AND es.code = r.source_code
+           WHERE r.record_no = ANY($1)`,
           [nos]
         );
         for (const row of res.rows) existing.set(row.record_no, row);
@@ -450,10 +460,13 @@ export class ActivityDataService {
 
   async getRecord(recordNo: string): Promise<ActivityRecord | null> {
     const res = await this.db.query<StoredRecord>(
-      `SELECT record_no, site_code, source_code, month, fuel_key, scope,
-              quantity_num, quantity_den, unit, is_correction,
-              supersedes_record_no, created_at
-       FROM activity_records WHERE record_no = $1`,
+      `SELECT r.record_no, r.site_code, r.source_code, r.month, r.fuel_key,
+              r.scope, r.quantity_num, r.quantity_den, r.unit, r.is_correction,
+              r.supersedes_record_no, r.created_at, es.facility_code
+       FROM activity_records r
+       JOIN emission_sources es
+         ON es.site_code = r.site_code AND es.code = r.source_code
+       WHERE r.record_no = $1`,
       [recordNo]
     );
     return res.rows[0] ? hydrate(res.rows[0]) : null;
@@ -525,8 +538,10 @@ export class ActivityDataService {
     const res = await client.query<StoredRecord>(
       `SELECT r.record_no, r.site_code, r.source_code, r.month, r.fuel_key,
               r.scope, r.quantity_num, r.quantity_den, r.unit, r.is_correction,
-              r.supersedes_record_no, r.created_at
+              r.supersedes_record_no, r.created_at, es.facility_code
        FROM activity_records r
+       JOIN emission_sources es
+         ON es.site_code = r.site_code AND es.code = r.source_code
        WHERE r.created_at <= $1
          AND NOT EXISTS (
              SELECT 1 FROM activity_records s

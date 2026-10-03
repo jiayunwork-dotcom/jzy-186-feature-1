@@ -7,7 +7,7 @@ import {
   Logger
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { ValidationException, ConflictError, NotFoundError } from './errors';
+import { ValidationException, ConflictError, NotFoundError, TransferNetworkError } from './errors';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -44,6 +44,18 @@ export class AllExceptionsFilter implements ExceptionFilter {
         statusCode: HttpStatus.NOT_FOUND,
         error: 'NotFound',
         message: exception.message,
+        path: request.url
+      });
+      return;
+    }
+    if (exception instanceof TransferNetworkError) {
+      response.status(HttpStatus.BAD_REQUEST).json({
+        statusCode: HttpStatus.BAD_REQUEST,
+        error: 'TransferNetworkError',
+        code: exception.code,
+        message: exception.message,
+        fields: exception.fields,
+        facilities: exception.facilities,
         path: request.url
       });
       return;

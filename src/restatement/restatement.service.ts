@@ -2,6 +2,7 @@ import { Injectable, Module } from '@nestjs/common';
 import { DbModule, DbService } from '../database/database.module';
 import { Fraction } from '../common/fraction';
 import { AccountingModule, AccountingService } from '../accounting/accounting.service';
+import { CompanyModule, CompanyService } from '../company/company.service';
 import {
   decomposeTotals,
   type Corners,
@@ -14,7 +15,14 @@ export interface RestatementComparisonInput {
   base: { cutId: number; factorVersionId: number; gwpSetId: number };
   current: { cutId: number; factorVersionId: number; gwpSetId: number };
   /** Aggregation filter the difference is evaluated at (any rollup level). */
-  filter?: AggregateQuery;
+  filter?: AggregateQuery & {
+    /**
+     * 'site' (default) keeps receiver-side transfer scope 2; 'company'
+     * eliminates internal transfers so each combustion is counted once.
+     * The two are identical when the caliber has no transfer data.
+     */
+    view?: 'site' | 'company';
+  };
   /** Base year (YYYY) when this comparison is used for the significance check. */
   baseYear?: number;
   significanceThreshold?: number | string;
@@ -44,7 +52,8 @@ export interface RestatementResult {
 export class RestatementService {
   constructor(
     private readonly db: DbService,
-    private readonly accounting: AccountingService
+    private readonly accounting: AccountingService,
+    private readonly company: CompanyService
   ) {}
 
   /**
@@ -78,7 +87,11 @@ export class RestatementService {
         factorVersionId: d.f,
         gwpSetId: d.g
       });
-      out[d.key] = this.accounting.grandTotal(bundle, filter);
+      const { view, ...leafFilter } = filter;
+      out[d.key] =
+        view === 'company'
+          ? this.company.report(bundle, leafFilter).net
+          : this.accounting.grandTotal(bundle, leafFilter);
     }
 
     const result: RestatementResult = {
@@ -193,7 +206,7 @@ function decomposeFromCorners(c: Corners<GasTotals>): MetricDecomposition[] {
 }
 
 @Module({
-  imports: [DbModule, AccountingModule],
+  imports: [DbModule, AccountingModule, CompanyModule],
   providers: [RestatementService],
   exports: [RestatementService]
 })

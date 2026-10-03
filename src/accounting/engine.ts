@@ -36,6 +36,8 @@ export interface LeafLineItem {
 
 /** Per record, one item per gas. The three gases always travel together. */
 export interface RecordLeaf {
+  kind: 'direct';
+  category: 'DIRECT';
   siteCode: string;
   sourceCode: string;
   month: string;
@@ -44,6 +46,12 @@ export interface RecordLeaf {
   fuelKey: string;
   unit: string;
   quantity: Fraction;
+  /**
+   * Facility this record is an input of (null = terminal direct record, the
+   * pre-transfer behaviour). Facility-bound records are NOT direct leaves:
+   * their emissions travel through the transfer allocation.
+   */
+  facilityCode: string | null;
   byGas: Record<
     Gas,
     {
@@ -54,6 +62,53 @@ export interface RecordLeaf {
       co2eTonnes: Fraction;
     }
   >;
+}
+
+/**
+ * Scope-2 leaf produced by the internal-transfer allocation: energy arriving
+ * at a site via an internal transfer, expressed per gas with its exact origin
+ * decomposition. `sourceCode` names the receiving use point (TRANSFER:<point>)
+ * so it can never collide with a purchased-energy source; `category`
+ * separates it from ordinary (external) scope 2 in every roll-up.
+ */
+export interface TransferLeaf {
+  kind: 'transfer';
+  category: 'TRANSFER';
+  siteCode: string;
+  sourceCode: string;
+  month: string;
+  scope: 2;
+  gas: Gas;
+  gasTonnes: Fraction;
+  co2eTonnes: Fraction;
+  edge: {
+    recordNo: string;
+    fromFacility: string;
+    toSite: string;
+    toUsePoint: string;
+    carrier: string;
+    quantity: Fraction;
+    /** receiver point feeds another facility (internal edge) or null = final use */
+    toFacility: string | null;
+    /** exact allocation coefficient p_fc × q/Q_fc on this edge */
+    coefficient: Fraction;
+  };
+  origins: Array<{
+    recordNo: string;
+    facility: string;
+    factorId: number;
+    share: Fraction;
+    gasTonnes: Fraction;
+  }>;
+}
+
+export type AccountingLeaf = RecordLeaf | TransferLeaf;
+
+/** Category of a scope-2 row; DIRECT is the pre-existing external energy. */
+export type LeafCategory = 'DIRECT' | 'TRANSFER';
+
+export function leafCategory(leaf: AccountingLeaf): LeafCategory {
+  return leaf.kind === 'transfer' ? 'TRANSFER' : 'DIRECT';
 }
 
 export interface FactorIndex {
@@ -107,6 +162,8 @@ export function evaluateRecord(record: ActivityRecord, idx: FactorIndex): Record
     byGas[gas] = { factorId: factor.id, factor, activityQty, gasTonnes, co2eTonnes };
   }
   return {
+    kind: 'direct',
+    category: 'DIRECT',
     siteCode: record.siteCode,
     sourceCode: record.sourceCode,
     month: record.month,
@@ -115,6 +172,7 @@ export function evaluateRecord(record: ActivityRecord, idx: FactorIndex): Record
     fuelKey: record.fuelKey,
     unit: record.unit,
     quantity: record.quantityFraction,
+    facilityCode: record.facilityCode ?? null,
     byGas
   };
 }
@@ -171,6 +229,8 @@ export interface AggregateRow {
   sourceCode: string | null;
   month: string | null;
   scope: 1 | 2;
+  /** DIRECT = ordinary activity record; TRANSFER = internal energy received. */
+  category: LeafCategory;
   totals: GasTotals;
 }
 
@@ -182,36 +242,54 @@ export interface AggregateQuery {
   sourceCode?: string | null;
   month?: string | null;
   scope?: 1 | 2 | null;
+  /** Restrict to direct external energy vs internal transfers. */
+  category?: LeafCategory | null;
 }
 
 function zeroTotals(): GasTotals {
   return { CO2: Fraction.ZERO, CH4: Fraction.ZERO, N2O: Fraction.ZERO, CO2E: Fraction.ZERO };
 }
 
-function rowMatches(leaf: RecordLeaf, query: AggregateQuery): boolean {
+function rowMatches(leaf: AccountingLeaf, query: AggregateQuery): boolean {
   if (query.siteCode && leaf.siteCode !== query.siteCode) return false;
   if (query.sourceCode && leaf.sourceCode !== query.sourceCode) return false;
   if (query.month && leaf.month !== query.month) return false;
   if (query.scope && leaf.scope !== query.scope) return false;
+  if (query.category && leafCategory(leaf) !== query.category) return false;
   return true;
+}
+
+/** Per-gas contributions of one leaf to an accumulator. */
+function addLeafToTotals(t: GasTotals, leaf: AccountingLeaf): void {
+  if (leaf.kind === 'transfer') {
+    t[leaf.gas] = t[leaf.gas].add(leaf.gasTonnes);
+    t.CO2E = t.CO2E.add(leaf.co2eTonnes);
+    return;
+  }
+  for (const gas of ['CO2', 'CH4', 'N2O'] as Gas[]) {
+    t[gas] = t[gas].add(leaf.byGas[gas].gasTonnes);
+    t.CO2E = t.CO2E.add(leaf.byGas[gas].co2eTonnes);
+  }
 }
 
 /**
  * Aggregate evaluated leaves.
  *
- * `groupBy` names the breakdown dimensions; scope is always a breakdown
- * column (scope 1 and scope 2 must never be silently merged). Rows are
- * returned sorted by every dimension and each gas is accumulated in the
- * fixed record-no order produced by evaluateAll/flattenLeaves, so repeated
- * runs yield bit-identical rationals.
+ * `groupBy` names the breakdown dimensions; scope and category are always
+ * breakdown columns (scope 1/2 and DIRECT/TRANSFER must never be silently
+ * merged). Rows are returned sorted by every dimension and each gas is
+ * accumulated in fixed record-no order, so repeated runs yield bit-identical
+ * rationals. With zero transfer data every leaf is DIRECT and the rows are
+ * exactly the pre-transfer ones.
  */
-export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): AggregateRow[] {
+export function aggregate(leaves: AccountingLeaf[], query: AggregateQuery = {}): AggregateRow[] {
   const groupBy = new Set<DimensionKey>(query.groupBy ?? ['site', 'source', 'month']);
   interface Group {
     siteCode: string | null;
     sourceCode: string | null;
     month: string | null;
     scope: 1 | 2;
+    category: LeafCategory;
     totals: GasTotals;
   }
   const groups = new Map<string, Group>();
@@ -221,17 +299,14 @@ export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): Agg
     const siteCode = groupBy.has('site') ? leaf.siteCode : null;
     const sourceCode = groupBy.has('source') ? leaf.sourceCode : null;
     const month = groupBy.has('month') ? leaf.month : null;
-    const key = JSON.stringify([siteCode, sourceCode, month, leaf.scope]);
+    const category = leafCategory(leaf);
+    const key = JSON.stringify([siteCode, sourceCode, month, leaf.scope, category]);
     let g = groups.get(key);
     if (!g) {
-      g = { siteCode, sourceCode, month, scope: leaf.scope, totals: zeroTotals() };
+      g = { siteCode, sourceCode, month, scope: leaf.scope, category, totals: zeroTotals() };
       groups.set(key, g);
     }
-    // Leaves arrive in record-no order, so this accumulation order is fixed.
-    for (const gas of ['CO2', 'CH4', 'N2O'] as Gas[]) {
-      g.totals[gas] = g.totals[gas].add(leaf.byGas[gas].gasTonnes);
-      g.totals.CO2E = g.totals.CO2E.add(leaf.byGas[gas].co2eTonnes);
-    }
+    addLeafToTotals(g.totals, leaf);
   }
 
   return [...groups.values()].sort((a, b) => {
@@ -239,20 +314,18 @@ export function aggregate(leaves: RecordLeaf[], query: AggregateQuery = {}): Agg
       (a.siteCode ?? '').localeCompare(b.siteCode ?? '') ||
       (a.sourceCode ?? '').localeCompare(b.sourceCode ?? '') ||
       (a.month ?? '').localeCompare(b.month ?? '') ||
-      a.scope - b.scope
+      a.scope - b.scope ||
+      a.category.localeCompare(b.category)
     );
   });
 }
 
 /** Total over a filter (the grand-total cell used by restatement checks). */
-export function grandTotal(leaves: RecordLeaf[], query: AggregateQuery = {}): GasTotals {
+export function grandTotal(leaves: AccountingLeaf[], query: AggregateQuery = {}): GasTotals {
   const t = zeroTotals();
   for (const leaf of leaves) {
     if (!rowMatches(leaf, query)) continue;
-    for (const gas of ['CO2', 'CH4', 'N2O'] as Gas[]) {
-      t[gas] = t[gas].add(leaf.byGas[gas].gasTonnes);
-      t.CO2E = t.CO2E.add(leaf.byGas[gas].co2eTonnes);
-    }
+    addLeafToTotals(t, leaf);
   }
   return t;
 }

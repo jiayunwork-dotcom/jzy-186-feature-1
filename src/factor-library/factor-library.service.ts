@@ -29,10 +29,24 @@ export interface FactorInput {
   validTo: string;
 }
 
+export interface CarrierEfficiencyInput {
+  /** energy carrier key, e.g. 'steam', 'electricity', 'hot_water' */
+  carrier: string;
+  /**
+   * Reference efficiency of a *stand-alone* product-generating unit for this
+   * carrier, dimensionless in (0, 1]. It is part of the factor version: the
+   * CHP reference-efficiency allocation uses it, so changing it is a factor
+   * change and is attributed to the factor component in a restatement.
+   */
+  refEfficiency: number | string;
+}
+
 export interface PublishFactorVersionInput {
   version: string;
   fuels?: FuelPropertyInput[];
   factors: FactorInput[];
+  /** Carrier reference efficiencies used by the transfer/CHP allocation. */
+  carriers?: CarrierEfficiencyInput[];
   publishedBy?: string;
   note?: string;
 }
@@ -106,6 +120,34 @@ function validateFactorInput(input: PublishFactorVersionInput): FieldError[] {
       }
     }
   });
+
+  // Carrier reference efficiencies must be finite decimals in (0, 1]; zero
+  // would make the CHP allocation denominator vanish.
+  (input.carriers ?? []).forEach((c, i) => {
+    if (!c.carrier) {
+      errors.push({ field: `carriers[${i}].carrier`, code: 'MISSING_FIELD', message: 'carrier required' });
+    }
+    try {
+      const frac = Fraction.from(c.refEfficiency);
+      if (frac.sign() <= 0 || frac.compare(Fraction.ONE) > 0) {
+        errors.push({
+          field: `carriers[${i}].refEfficiency`,
+          code: 'INVALID_VALUE',
+          message: 'reference efficiency must satisfy 0 < refEfficiency <= 1'
+        });
+      }
+    } catch {
+      errors.push({
+        field: `carriers[${i}].refEfficiency`,
+        code: 'INVALID_VALUE',
+        message: `not a finite decimal: ${String(c.refEfficiency)}`
+      });
+    }
+  });
+  const carrierKeys = (input.carriers ?? []).map((c) => c.carrier);
+  if (new Set(carrierKeys).size !== carrierKeys.length) {
+    errors.push({ field: 'carriers', code: 'DUPLICATE_KEY', message: 'duplicate carrier entry' });
+  }
 
   input.factors.forEach((f, i) => {
     const prefix = `factors[${i}]`;
@@ -222,6 +264,16 @@ export class FactorLibraryService {
         );
       }
 
+      for (const carrier of input.carriers ?? []) {
+        const eff = Fraction.from(carrier.refEfficiency);
+        await client.query(
+          `INSERT INTO carrier_efficiencies(factor_version_id, carrier,
+             ref_eff_num, ref_eff_den)
+           VALUES ($1, $2, $3, $4)`,
+          [versionId, carrier.carrier, eff.num, eff.den]
+        );
+      }
+
       for (const f of input.factors) {
         const value = Fraction.from(f.value);
         // Store the declared unit verbatim; kg normalization is derived.
@@ -304,6 +356,31 @@ export class FactorLibraryService {
         density: r.density_num !== null ? Fraction.of(BigInt(r.density_num), BigInt(r.density_den!)) : null,
         ncv: r.ncv_num !== null ? Fraction.of(BigInt(r.ncv_num), BigInt(r.ncv_den!)) : null
       });
+    }
+    return map;
+  }
+
+  /**
+   * Carrier reference efficiencies published with this version. Returned as a
+   * carrier -> Fraction(dimensionless) map; the transfer engine errors if a
+   * produced carrier has no entry (allocation would otherwise be undefined).
+   */
+  async getCarrierEfficiencies(
+    client: Queryer,
+    versionId: number
+  ): Promise<Map<string, Fraction>> {
+    const res = await client.query<{
+      carrier: string;
+      ref_eff_num: string;
+      ref_eff_den: string;
+    }>(
+      `SELECT carrier, ref_eff_num, ref_eff_den
+       FROM carrier_efficiencies WHERE factor_version_id = $1`,
+      [versionId]
+    );
+    const map = new Map<string, Fraction>();
+    for (const r of res.rows) {
+      map.set(r.carrier, Fraction.of(BigInt(r.ref_eff_num), BigInt(r.ref_eff_den)));
     }
     return map;
   }
